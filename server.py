@@ -20,6 +20,27 @@ _CLIENT_LOCK = threading.Lock()
 _CLIENT_LOGIN_TTL = 600  # seconds
 _CLIENT_LAST_LOGIN: float = 0.0
 
+CAT_MOVIE = 2000
+CAT_TV = 5000
+CAT_ANIME = 5070
+CAT_ADULT = 6000
+
+# Regex for Adult content (Newsgroup based)
+ADULT_GROUP_RE = re.compile(r"(?i)(erotica|adult|porn|xxx|sex)")
+
+# Regex for Anime content
+# Matches CRC hashes often found in anime filenames: [A1B2C3D4]
+# Also matches if "Anime" is explicitly in the filename.
+# Uses re.IGNORECASE to handle 'anime', 'Anime', etc.
+ANIME_CRC_RE = re.compile(r"\[[0-9a-fA-F]{8}\]|\b(?:anime)\b", re.IGNORECASE)
+
+# Regex for TV content (Filename based)
+# Matches: S01E01, 1x01, Season 1, Episode 1, E01, etc.
+# Ensures boundaries to avoid false positives like "1080p" or "Movie 2000"
+TV_FILENAME_RE = re.compile(
+    r"(?i)(?:^|[\W_])(?:s\d{1,4}(?:[ \.\-_]*e\d{1,4})?|\d{1,2}x\d{1,4}|season[ \.\-_]*\d+|(?:episode|ep)[ \.\-_]*\d+|e\d{1,4})(?:$|[\W_])"
+)
+
 
 def _load_dotenv():
     path = os.path.join(os.getcwd(), ".env")
@@ -151,7 +172,7 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
                 return datetime.fromtimestamp(int(text), tz=timezone.utc)
             except (OverflowError, OSError, ValueError):
                 return None
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%m-%d-%Y %H:%M:%S"):
             try:
                 dt = datetime.strptime(text.replace("Z", "+0000"), fmt)
                 if dt.tzinfo is None:
@@ -174,6 +195,8 @@ _ALLOWED_VIDEO_EXTENSIONS = {
     ".mpeg",
     ".flv",
     ".webm",
+    ".iso",
+    ".divx",
 }
 
 _STOPWORDS = {
@@ -190,8 +213,18 @@ _STOPWORDS = {
 _MIN_DURATION_SECONDS = 60
 _TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
 _QUALITY_RE = re.compile(r"(2160|1440|1080|720|480|360)\s*(p|i)?", re.IGNORECASE)
-_YEAR_RE = re.compile(r"(19|20)\d{2}")
-_SEASON_EP_RE = re.compile(r"(?:s(?P<season>\d{1,2})e(?P<episode>\d{1,2})|(?P<season2>\d{1,2})x(?P<episode2>\d{1,2}))", re.IGNORECASE)
+# Updated regex matches 19xx or 20xx, but ignores them if followed by 'p' or 'P'
+# This prevents "2048p" resolution from being parsed as the year 2048.
+_YEAR_RE = re.compile(r"(19|20)\d{2}(?![pP])")
+# Updated regex:
+# 1. Matches standard S01E01 format
+# 2. Matches 1x01 format ONLY if it starts at a word boundary (\b)
+#    This prevents "1920x1080" from being skipped once and then matching as "920x1080"
+# 3. Excludes common resolutions from being matched as Season x Episode
+_SEASON_EP_RE = re.compile(
+    r"(?:s(?P<season>\d{1,4})e(?P<episode>\d{1,4})|\b(?!(?:3840x2160|2560x1440|1920x1080|1440x1080|1280x720|854x480|720x576|720x480|640x480|640x360|480x360|426x240|320x240|256x144|192x144))(?P<season2>\d{1,4})x(?P<episode2>\d{1,4}))",
+    re.IGNORECASE
+)
 _SANITIZE_SYMBOLS_RE = re.compile(r"[\.\-_:\s]+")
 _NON_ALNUM_RE = re.compile(r"[^\w\sÀ-ÿ]")
 
@@ -311,10 +344,12 @@ def _extract_quality(*texts: Optional[str]) -> Optional[str]:
 def _build_thumbnail_url(base: Optional[str], hash_id: Optional[str], slug: Optional[str]) -> Optional[str]:
     if not base or not hash_id:
         return None
-    base = base.rstrip("/") + "/"
+    # Base is usually "https://th.easynews.com/thumbnails-"
+    # We strictly remove the trailing slash and append the prefix directly
+    # (e.g., "thumbnails-" + "2dc" becomes "thumbnails-2dc")
+    base = base.rstrip("/")
     prefix = hash_id[:3]
-    safe_slug = quote((slug or hash_id).replace("/", "_"))
-    return f"{base}{prefix}/pr-{hash_id}.jpg/th-{safe_slug}.jpg"
+    return f"{base}{prefix}/th-{hash_id}.jpg"
 
 
 def _extract_release_markers(text: str, quality_hint: Optional[str] = None) -> Dict[str, Optional[Any]]:
@@ -356,6 +391,26 @@ def _matches_strict(title: str, strict_phrase: Optional[str]) -> bool:
     return False
 
 
+def _detect_category(filename: str, group: str) -> int:
+    # Priority 1: Adult Filter (Safety First)
+    if group and ADULT_GROUP_RE.search(group):
+        return CAT_ADULT
+
+    # Priority 2: Anime Detection
+    # Checks for "anime" in the usenet binary group name OR [CRC] hash in filename
+    if group and "anime" in group.lower():
+        return CAT_ANIME
+    if filename and ANIME_CRC_RE.search(filename):
+        return CAT_ANIME
+
+    # Priority 3: TV Detection (Filename Only)
+    if filename and TV_FILENAME_RE.search(filename):
+        return CAT_TV
+
+    # Priority 4: Default Fallback
+    return CAT_MOVIE
+
+
 def filter_and_map(
     json_data: dict,
     min_bytes: int,
@@ -363,9 +418,11 @@ def filter_and_map(
     query_meta: Optional[Dict[str, Optional[Any]]] = None,
     strict_phrase: Optional[str] = None,
     strict_match: bool = False,
+    search_mode: str = "search",
 ) -> List[dict]:
     token_set: Set[str] = set(query_tokens or [])
     thumb_base = json_data.get("thumbURL") or json_data.get("thumbUrl")
+
     out: List[dict] = []
     for it in json_data.get("data", []):
         hash_id: Optional[str] = None
@@ -381,6 +438,8 @@ def filter_and_map(
         duration_raw: Any = None
         fullres: Optional[str] = None
 
+        group: Optional[str] = None
+
         if isinstance(it, list):
             if len(it) >= 12:
                 hash_id = it[0]
@@ -391,6 +450,8 @@ def filter_and_map(
                 poster = it[7]
             if len(it) > 8:
                 posted_raw = it[8]
+            if len(it) > 9:
+                group = it[9]
             if len(it) > 14:
                 duration_raw = it[14]
         elif isinstance(it, dict):
@@ -400,12 +461,27 @@ def filter_and_map(
             ext = it.get("ext") or it.get("11")
             size = it.get("size", 0)
             poster = it.get("poster") or it.get("7")
-            posted_raw = it.get("dtime") or it.get("date") or it.get("12")
+            posted_raw = it.get("dtime") or it.get("date") or it.get("5")
+            group = it.get("group") or it.get("9")
             sig = it.get("sig")
             display_fn = it.get("fn") or it.get("filename")
             extension_field = it.get("extension") or it.get("ext")
             duration_raw = it.get("14") or it.get("duration") or it.get("len")
             fullres = it.get("fullres") or it.get("resolution")
+
+            # Metadata Expansion
+            runtime_sec = it.get("runtime")
+            vcodec = it.get("vcodec")
+            acodec = it.get("acodec")
+            audio_langs = it.get("alangs") or it.get("audio_tracks") or []
+            sub_langs = it.get("slangs") or it.get("subtitle_tracks") or []
+            width = it.get("width")
+            height = it.get("height")
+            fps = it.get("fps")
+            item_id = it.get("id")
+            nfo_status = it.get("nfo")
+
+        print(f"[DEBUG] Raw Date: {posted_raw} | Type: {type(posted_raw)}")
 
         if not hash_id or not ext:
             continue
@@ -463,12 +539,19 @@ def filter_and_map(
             t_season = title_meta.get("season")
             t_episode = title_meta.get("episode")
             t_quality = quality or title_meta.get("quality")
-            if q_year and t_year and q_year != t_year:
+            
+            # Strict Year Matching: If user asks for Year, file MUST have it and it MUST match.
+            if q_year and (t_year is None or q_year != t_year):
                 continue
-            if q_season and t_season and q_season != t_season:
+
+            # Strict Season Matching
+            if q_season and (t_season is None or t_season != q_season):
                 continue
-            if q_episode and t_episode and q_episode != t_episode:
+
+            # Strict Episode Matching
+            if q_episode and (t_episode is None or t_episode != q_episode):
                 continue
+
             if q_quality and t_quality and q_quality.lower() != t_quality.lower():
                 continue
 
@@ -480,6 +563,14 @@ def filter_and_map(
         duration_formatted = _format_duration(duration_seconds)
         thumbnail_url = _build_thumbnail_url(thumb_base, hash_id, filename_no_ext)
         year = title_meta.get("year")
+
+        cat_id = _detect_category(title, group or "")
+        print(f"[DEBUG] Cat: {cat_id} | Group: {group} | File: {title}")
+
+        if search_mode == "tvsearch" and cat_id != CAT_TV and cat_id != CAT_ANIME:
+            continue
+        if search_mode == "movie" and cat_id != CAT_MOVIE and cat_id != CAT_ANIME:
+            continue
 
         out.append(
             {
@@ -498,6 +589,19 @@ def filter_and_map(
                 "year": year,
                 "season": title_meta.get("season"),
                 "episode": title_meta.get("episode"),
+                "category_id": cat_id,
+                # Metadata Expansion
+                "runtime_sec": runtime_sec,
+                "vcodec": vcodec,
+                "acodec": acodec,
+                "audio_langs": audio_langs,
+                "sub_langs": sub_langs,
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "thumb_base": thumb_base,
+                "item_id": item_id,
+                "nfo_status": nfo_status,
             }
         )
     return out
@@ -513,16 +617,19 @@ def api():
         xml = (
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
             "<caps>"
-            "<server version=\"0.1\" title=\"Easynews Bridge\"/>"
-            "<limits maxrequests=\"100\" defaultlimit=\"100\"/>"
+            "<server version=\"0.2\" title=\"Easynews Indexer Bridge\"/>"
+            "<limits max=\"100\" default=\"100\"/>"
             "<registration available=\"no\" open=\"no\"/>"
             "<searching>"
             "<search available=\"yes\" supportedParams=\"q\"/>"
             "<movie-search available=\"yes\" supportedParams=\"q,year\"/>"
-            "<tv-search available=\"yes\" supportedParams=\"q,season,ep\"/>"
+            "<tv-search available=\"yes\" supportedParams=\"q,season,ep,year\"/>"
             "</searching>"
             "<categories>"
             "<category id=\"2000\" name=\"Movies\"/>"
+            "<category id=\"5000\" name=\"TV\"/>"
+            "<category id=\"5070\" name=\"Anime\"/>"
+            "<category id=\"6000\" name=\"Adult\"/>"
             "</categories>"
             "</caps>"
         )
@@ -542,13 +649,14 @@ def api():
             search_components.append(base_query)
 
         if t == "movie":
-            if year_int and str(year_int) not in base_query:
-                search_components.append(str(year_int))
+            # We rely on filter_and_map to check the year strictly.
+            # Sending it to Easynews might exclude valid results that lack the year in the text title.
+            pass
         elif t == "tvsearch":
-            if season_int is not None and episode_int is not None:
-                search_components.append(f"S{season_int:02}E{episode_int:02}")
-            elif season_int is not None:
-                search_components.append(f"S{season_int:02}")
+            # Similarly for TV, we rely on local regex filtering for Season/Episode/Year.
+            pass
+            
+            # Optional: You can keep year if you want, but often safer to filter locally too
             if year_int and str(year_int) not in base_query:
                 search_components.append(str(year_int))
 
@@ -602,7 +710,7 @@ def api():
             # aim for maximum results per page
             data = c.search(query=q, file_type="VIDEO", per_page=250, sort_field="relevance", sort_dir="-")
             if fallback_query:
-                items = filter_and_map(data, min_bytes=min_bytes)
+                items = filter_and_map(data, min_bytes=min_bytes, search_mode=t)
             else:
                 items = filter_and_map(
                     data,
@@ -611,6 +719,7 @@ def api():
                     query_meta=query_meta,
                     strict_phrase=strict_phrase,
                     strict_match=strict_requested,
+                    search_mode=t,
                 )
 
         # Trim by limit (handles fallback and real queries)
@@ -649,33 +758,64 @@ def api():
             year = it.get("year")
             season = it.get("season")
             episode = it.get("episode")
+            cat_id = it.get("category_id", CAT_MOVIE)
+
             attr_parts = [
                 f"<newznab:attr name=\"size\" value=\"{size}\"/>",
-                f"<newznab:attr name=\"category\" value=\"2000\"/>",
+                f"<newznab:attr name=\"category\" value=\"{cat_id}\"/>",
                 f"<newznab:attr name=\"usenetdate\" value=\"{posted_str}\"/>",
                 f"<newznab:attr name=\"posted\" value=\"{posted_epoch}\"/>",
             ]
-            if poster:
-                attr_parts.append(f"<newznab:attr name=\"poster\" value=\"{xml_escape(poster)}\"/>")
-            if quality:
-                attr_parts.append(f"<newznab:attr name=\"quality\" value=\"{xml_escape(quality)}\"/>")
-            if duration_hms:
-                attr_parts.append(f"<newznab:attr name=\"duration\" value=\"{duration_hms}\"/>")
-            if thumb:
-                attr_parts.append(f"<newznab:attr name=\"thumb\" value=\"{xml_escape(thumb)}\"/>")
+
             if year:
                 attr_parts.append(f"<newznab:attr name=\"year\" value=\"{year}\"/>")
             if season:
                 attr_parts.append(f"<newznab:attr name=\"season\" value=\"{season}\"/>")
             if episode:
                 attr_parts.append(f"<newznab:attr name=\"episode\" value=\"{episode}\"/>")
+
+            # Metadata Expansion Attributes
+            if it.get("runtime_sec"):
+                runtime_min = int(it["runtime_sec"]) // 60
+                attr_parts.append(f"<newznab:attr name=\"runtime\" value=\"{runtime_min}\"/>")
+            
+            if it.get("vcodec"):
+                attr_parts.append(f"<newznab:attr name=\"video_codec\" value=\"{it['vcodec']}\"/>")
+            if it.get("acodec"):
+                attr_parts.append(f"<newznab:attr name=\"audio_codec\" value=\"{it['acodec']}\"/>")
+            if it.get("width") and it.get("height"):
+                attr_parts.append(f"<newznab:attr name=\"resolution\" value=\"{it['width']}x{it['height']}\"/>")
+            if it.get("fps"):
+                attr_parts.append(f"<newznab:attr name=\"framerate\" value=\"{it['fps']}\"/>")
+            if it.get("audio_langs"):
+                # Join list if it's a list
+                langs = it["audio_langs"]
+                if isinstance(langs, list):
+                    langs = ",".join(langs)
+                attr_parts.append(f"<newznab:attr name=\"language\" value=\"{langs}\"/>")
+            if it.get("sub_langs"):
+                subs = it["sub_langs"]
+                if isinstance(subs, list):
+                    subs = ",".join(subs)
+                attr_parts.append(f"<newznab:attr name=\"subs\" value=\"{subs}\"/>")
+            
+            # Cover URL
+            if it.get("thumbnail"):
+                 cover_url = it.get("thumbnail")
+                 attr_parts.append(f"<newznab:attr name=\"coverurl\" value=\"{cover_url}\"/>")
+
+            if it.get("nfo_status"):
+                 attr_parts.append(f"<newznab:attr name=\"nfo\" value=\"1\"/>")
+
             attr_xml = "".join(attr_parts)
             item_xml = (
                 f"<item>"
                 f"<title>{title}</title>"
                 f"<guid isPermaLink=\"false\">{guid}</guid>"
                 f"<link>{safe_link}</link>"
-                f"<category>2000</category>"
+                f"<link>{safe_link}</link>"
+                f"<category>{cat_id}</category>"
+                f"<pubDate>{posted_str}</pubDate>"
                 f"<pubDate>{posted_str}</pubDate>"
                 f"{attr_xml}"
                 f"<enclosure url=\"{safe_link}\" length=\"{size}\" type=\"application/x-nzb\"/>"
