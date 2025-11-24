@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 
 EASYNEWS_BASE = "https://members.easynews.com"
@@ -53,6 +55,18 @@ class EasynewsClient:
         self.username = username
         self.password = password
         self.s = session or requests.Session()
+        
+        # Configure robust retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST", "OPTIONS"],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.s.mount("https://", adapter)
+        self.s.mount("http://", adapter)
+
         # Default headers
         self.s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EasynewsClient/1.0",
@@ -66,13 +80,16 @@ class EasynewsClient:
         Prime session and validate credentials using a quick authenticated call.
         This relies on HTTP Basic Auth configured on the session.
         """
-        self.s.get(f"{EASYNEWS_BASE}/2.0/")
-        check = self.s.get(
-            f"{EASYNEWS_BASE}/2.0/search/solr-search/?fly=2&gps=test&sb=1&pno=1&pby=1&u=1&chxu=1&chxgx=1&st=basic&s1=dtime&s1d=-&sS=3&vv=1&fty%5B%5D=VIDEO",
-            allow_redirects=True,
-        )
-        if check.status_code in (401, 403):
-            raise EasynewsError("Unauthorized; check username/password")
+        try:
+            self.s.get(f"{EASYNEWS_BASE}/2.0/")
+            check = self.s.get(
+                f"{EASYNEWS_BASE}/2.0/search/solr-search/?fly=2&gps=test&sb=1&pno=1&pby=1&u=1&chxu=1&chxgx=1&st=basic&s1=dtime&s1d=-&sS=3&vv=1&fty%5B%5D=VIDEO",
+                allow_redirects=True,
+            )
+            if check.status_code in (401, 403):
+                raise EasynewsError("Unauthorized; check username/password")
+        except requests.exceptions.RequestException as e:
+            raise EasynewsError(f"Connection error during login: {e}") from e
 
     def search(
         self,
@@ -116,9 +133,12 @@ class EasynewsClient:
         query_params = "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()]) + f"&fty%5B%5D={requests.utils.quote(file_type)}"
         full_url = f"{url}?{query_params}"
 
-        r = self.s.get(full_url)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = self.s.get(full_url)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            raise EasynewsError(f"Connection error during search: {e}") from e
 
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:
