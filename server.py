@@ -69,8 +69,21 @@ EZ_PASS = os.environ.get("EASYNEWS_PASS")
 
 
 def require_apikey() -> bool:
-    key = request.args.get("apikey") or request.headers.get("X-Api-Key")
-    return (API_KEY is None) or (key == API_KEY)
+    candidates = [
+        request.args.get("apikey"),
+        request.headers.get("X-Api-Key"),
+        request.headers.get("apikey"),
+    ]
+    # If API_KEY is None (not set), we allow access (dev mode or similar)
+    if API_KEY is None:
+        return True
+    
+    # Check if ANY of the provided keys match the expected API_KEY
+    for key in candidates:
+        if key == API_KEY:
+            return True
+            
+    return False
 
 
 def client() -> EasynewsClient:
